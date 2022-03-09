@@ -1,0 +1,414 @@
+!pip install bioinfokit
+
+import pandas as pd
+import numpy as np
+import scipy as sp
+
+from time import time
+
+import torch
+from torch import nn
+from torch import functional as F
+from torch.optim import SGD
+from torch.utils.data import TensorDataset, DataLoader
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, confusion_matrix
+from sklearn.metrics import roc_curve, auc, roc_auc_score
+from bioinfokit.visuz import stat
+
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
+
+import plotly.graph_objects as go
+import plotly.express as px
+import matplotlib.pyplot as plt
+from itertools import groupby
+
+df = pd.read_csv("train.csv")
+print(df.head(10).to_string())
+
+'Pre-processing: renaming variables'
+name_dict = {"icustay id": "id",
+             "Capillary refill rate": "cap",
+             "Diastolic blood pressure": "dbp",
+             "Fraction inspired oxygen": "fio2",
+             "Glascow coma scale eye opening": "gcs_eye",
+             "Glascow coma scale motor response": "gcs_motor",
+             "Glascow coma scale total": "gcs_total",
+             "Glascow coma scale verbal response": "gcs_verbal",
+             "Glucose": "glu",
+             "Heart Rate": "hr",
+             "Height": "ht",
+             "Mean blood pressure": "mbp",
+             "Oxygen saturation": "o2",
+             "Respiratory rate": "rr",
+             "Systolic blood pressure": "sbp",
+             "Temperature": "temp",
+             "Weight": "wt",
+             "pH": "ph"}
+df.rename(name_dict, axis="columns", inplace=True)
+
+'Pre-processing: GCS to numeric form'
+print(df['gcs_eye'].value_counts())
+gcs_eye_dict = {"4 Spontaneously": 4,
+                "Spontaneously": 4,
+                "1 No Response": 1,
+                "None": 1,
+                "3 To speech": 3,
+                "To Speech": 3,
+                "2 To pain": 2,
+                "To Pain": 2}
+df['gcs_eye'].replace(to_replace=gcs_eye_dict, inplace=True)
+print(df['gcs_eye'].value_counts())
+
+print(df['gcs_motor'].value_counts())
+gcs_motor_dict = {"6 Obeys Commands": 6,
+                "Obeys Commands": 6,
+                "5 Localizes Pain": 5,
+                "Localizes Pain": 5,
+                "4 Flex-withdraws": 4,
+                "Flex-withdraws": 4,
+                "1 No Response": 1,
+                "No response": 1,
+                "3 Abnorm flexion": 3,
+                "Abnormal Flexion": 3,
+                "2 Abnorm extensn": 2,
+                "Abnormal extension": 2}
+df['gcs_motor'].replace(to_replace=gcs_motor_dict, inplace=True)
+print(df['gcs_motor'].value_counts())
+
+print(df['gcs_verbal'].value_counts())
+gcs_verbal_dict = {"5 Oriented": 5,
+                "Oriented": 5,
+                "4 Confused": 4,
+                "Confused": 4,
+                "3 Inapprop words": 3,
+                "Inappropriate Words": 3,
+                "Incomprehensible sounds": 2,
+                "2 Incomp sounds": 2,
+                "1.0 ET/Trach": 1,
+                "No Response-ETT": 1,
+                "No Response": 1,
+                "1 No Response": 1}
+df.insert(8, "ett", 0)
+df['ett'] = np.where(df["gcs_verbal"] == "1.0 ET/Trach", 1, df['ett'])
+df['ett'] = np.where(df["gcs_verbal"] == "No Response-ETT", 1, df['ett'])
+df['gcs_verbal'].replace(to_replace=gcs_verbal_dict, inplace=True)
+print(df['gcs_verbal'].value_counts())
+print(df['ett'].value_counts())
+
+'Pre-processing: removing outliers'
+print(df.describe().to_string())
+'Cap: only 323 records out of 17903, but no outliers'
+
+'DBP: noted min of 0.00 and max of 100105.01, both values outside of human range'
+print(df['dbp'].nsmallest(10).to_string())
+#Set DBP = 0 to DBP = 11 (next smallest)
+df['dbp'] = np.where(df["dbp"] == 0, 11, df['dbp'])
+print(df['dbp'].nsmallest(10).to_string())
+print(df['dbp'].nlargest(10).to_string())
+#Set DBP > 258 to DBP = 258
+df['dbp'] = np.where(df["dbp"] > 258, 258, df['dbp'])
+print(df['dbp'].describe().to_string())
+
+'FiO2: noted min of 0 and max of 1.99, both values outside of human range'
+print(df[df["fio2"] > 1].to_string())
+#Set FiO2 = 1.99 to FiO2 = 1.00
+df['fio2'] = np.where(df["fio2"] > 1, 1, df['fio2'])
+print(df['fio2'].describe().to_string())
+
+'gcs_eye, gcs_motor, gcs_verbal, gcs_total are all normal, but calculations can be performed via equation to reduce NaN'
+
+for i in range(len(df.index)):
+    if (df.at[df.index[i], "gcs_total"] == np.NaN) and (df.at[df.index[i], "gcs_eye"] != np.NaN) and (df.at[df.index[i], "gcs_motor"] != np.NaN) and (df.at[df.index[i], "gcs_verbal"] != np.NaN):
+        df.at[df.index[i], "gcs_total"] = df.at[df.index[i], "gcs_eye"] + df.at[df.index[i], "gcs_motor"] + df.at[df.index[i], "gcs_verbal"]
+    if (df.at[df.index[i], "gcs_eye"] == np.NaN) and (df.at[df.index[i], "gcs_total"] != np.NaN) and (df.at[df.index[i], "gcs_motor"] != np.NaN) and (df.at[df.index[i], "gcs_verbal"] != np.NaN):
+        df.at[df.index[i], "gcs_eye"] = df.at[df.index[i], "gcs_total"] - (df.at[df.index[i], "gcs_motor"] + df.at[df.index[i], "gcs_verbal"])
+    if (df.at[df.index[i], "gcs_motor"] == np.NaN) and (df.at[df.index[i], "gcs_total"] != np.NaN) and (df.at[df.index[i], "gcs_eye"] != np.NaN) and (df.at[df.index[i], "gcs_verbal"] != np.NaN):
+        df.at[df.index[i], "gcs_motor"] = df.at[df.index[i], "gcs_total"] - (df.at[df.index[i], "gcs_eye"] + df.at[df.index[i], "gcs_verbal"])
+    if (df.at[df.index[i], "gcs_verbal"] == np.NaN) and (df.at[df.index[i], "gcs_eye"] != np.NaN) and (df.at[df.index[i], "gcs_motor"] != np.NaN) and (df.at[df.index[i], "gcs_total"] != np.NaN):
+        df.at[df.index[i], "gcs_verbal"] = df.at[df.index[i], "gcs_total"] - (df.at[df.index[i], "gcs_motor"] + df.at[df.index[i], "gcs_eye"])
+
+#for x in ["gcs_total", "gcs_eye", "gcs_motor", "gcs_verbal"]:
+#    print(x)
+#    print(df[x].value_counts())
+
+'Glu: noted min of 0 and max of 9999, 9999 is outside of human range'
+print(df['glu'].nsmallest(10).to_string())
+print(df['glu'].nlargest(10).to_string())
+#Set Glu = 9999 to 1476 (next largest)
+df['glu'] = np.where(df["glu"] == 9999, 1476, df['glu'])
+print(df['glu'].describe().to_string())
+
+'HR: noted min of 0 and max of 941, which is outside of human range'
+print(df['hr'].nsmallest(10).to_string())
+#Set HR = 0 to HR = 19 (next smallest)
+df['hr'] = np.where(df["hr"] == 0, 19, df['hr'])
+print(df['hr'].nlargest(10).to_string())
+#Set HR = 941 and 900 to HR = 190 (next largest)
+df['hr'] = np.where(df["hr"] > 899, 190, df['hr'])
+print(df['hr'].describe().to_string())
+
+'Ht: only 3385 records, noted min of 0 and max of 429, assuming cm and Caucasian adult, this is impossible'
+print(df['ht'].nsmallest(10).to_string())
+#Set Ht < 20 to 64 (ht of 16 cm or less is impossible even with amputation, the average size of an adult head is already 20 cm)
+df['ht'] = np.where(df["ht"] < 17, 64, df['ht'])
+print(df['ht'].nlargest(10).to_string())
+#Set Ht = 429 to Ht = 209
+df['ht'] = np.where(df["ht"] == 429, 209, df['ht'])
+print(df['ht'].describe().to_string())
+
+'O2: normal'
+
+'RR: noted min of 0 and max of 115'
+print(df[df["rr"] == 0].to_string())
+print(df['rr'].nlargest(10).to_string())
+#All values are potentially possible due to presence of tracheostomy
+
+'SBP: noted min of 0 max of 281, SBP=0 is impossible but 281 is possible'
+print(df['sbp'].nlargest(10).to_string())
+#No changes necessary
+print(df['sbp'].nsmallest(20).to_string())
+#Set all SBP < 12 to SBP = 38 (next smallest)
+df['sbp'] = np.where(df["sbp"] < 12, 38, df['sbp'])
+print(df['sbp'].describe().to_string())
+
+'MBP: noted min of -34 and max of 6350, equation of 1/3(SBP)+2/3(DBP) can be used to reduce NaN, only useful if SBP/DBP unavailable due to colinearity'
+#Noted that min DBP = 11 and min SBP = 38 i.e. min MBP must be 20
+print(df['mbp'].nsmallest(20).to_string())
+#Set all MBP < 20 to 21 (next smallest)
+df['mbp'] = np.where(df["mbp"] < 20, 21, df['mbp'])
+#Noted that max DBP = 258 and max SBP = 281 i.e. max MBP must be 265.667
+print(df['mbp'].nlargest(10).to_string())
+#Set MBP > 265 to 244 (next highest)
+df['mbp'] = np.where(df["mbp"] > 265, 244, df['mbp'])
+print(df['mbp'].describe().to_string())
+
+'Temp: noted min of 0 and max of 60, remove Temp=60 for being impossible'
+print(df['temp'].nsmallest(10).to_string())
+#Set Temp = 0 to Temp = 26.666700 (next smallest)
+df['temp'] = np.where(df["temp"] == 0, 26.666700, df['temp'])
+print(df['temp'].nlargest(10).to_string())
+#Set Temp = 60 to Temp = 42 (next highest)
+df['temp'] = np.where(df["temp"] == 60, 42, df['temp'])
+print(df['temp'].describe().to_string())
+
+'Wt: noted min of 0 and max of 8 million, world record for weight is 635'
+print(df['wt'].nlargest(10).to_string())
+#Set wt > 635 to Wt = 280 (next highest)
+df['wt'] = np.where(df["wt"] > 635, 280, df['wt'])
+print(df['wt'].nsmallest(20).to_string())
+#Set wt < 2kg to 20kg (next smallest) as 1kg is not possible for a human
+df['wt'] = np.where(df["wt"] < 2, 20, df['wt'])
+print(df['wt'].describe().to_string())
+
+'pH: noted min of 0 and max of 100, but pH>14 is impossible'
+print(df['ph'].nlargest(10).to_string())
+#Set pH>14 to 9 (next highest)
+df['ph'] = np.where(df['ph'] > 14, 9, df['ph'])
+print(df['ph'].nsmallest(10).to_string())
+#Set pH<5 to 5 (next smallest)
+df['ph'] = np.where(df['ph'] < 5, 5, df['ph'])
+print(df['ph'].describe().to_string())
+
+'New variable: BMI'
+df.insert(18, "bmi", np.NaN)
+for i in range(len(df.index)):
+    if (df.at[df.index[i], "ht"] != np.NaN) and (df.at[df.index[i], "wt"] != np.NaN):
+        df.at[df.index[i], "bmi"] = df.at[df.index[i], "wt"] / ((df.at[df.index[i], "ht"])/100) / ((df.at[df.index[i], "ht"])/100)
+
+'New variable: GCS Categorical (1 = severe brain injury, 2 = moderate brain injury, 3 = mild brain injury)'
+df.insert(20, "gcs_cat", np.NaN)
+for i in range(len(df.index)):
+    if df.at[df.index[i], "gcs_total"] > 12: df.at[df.index[i], "gcs_cat"] = 3
+    if df.at[df.index[i], "gcs_total"] < 9:  df.at[df.index[i], "gcs_cat"] = 1
+    if df.at[df.index[i], "gcs_total"] > 8 and df.at[df.index[i], "gcs_total"] < 13:  df.at[df.index[i], "gcs_cat"] = 2
+print(df['gcs_total'].value_counts())
+print(df['gcs_cat'].value_counts())
+#Checked sums to confirm all correct
+
+'Pre-processing complete'
+
+df.to_csv("preprocessed.csv", sep=",")
+
+column_names = list(df.columns.values)
+column_names.remove("label")
+column_names.remove("id")
+column_names.remove("cap")
+column_names.remove("fio2")
+column_names.remove("ht")
+column_names.remove("bmi")
+column_names.remove("gcs_eye")
+column_names.remove("gcs_verbal")
+column_names.remove("gcs_motor")
+column_names.remove("gcs_total")
+column_names.remove("mbp")
+column_names.remove("glu")
+column_names.remove("o2")
+column_names.remove("ph")
+
+for x in column_names:
+    df[x].fillna(df[x].mean(), inplace=True)
+#print(df[column_names].describe().to_string())
+
+X = df[column_names]
+Y = df[["label"]]
+id_all = np.arange(len(df))
+
+XTrain, XTest, YTrain, YTest, ID_train, ID_test = train_test_split(X, Y, id_all, test_size=0.3, random_state=1031)
+df_train = df.iloc[ID_train]
+df_test = df.iloc[ID_test]
+
+#print(XTrain.describe().to_string())
+#print(YTrain.describe().to_string())
+#print(XTest.describe().to_string())
+#print(YTest.describe().to_string())
+
+'Model 1: Logistic Regression'
+
+print("training with Logistic Regression ...")
+start = time()
+model = sm.Logit(endog=YTrain, exog=XTrain).fit()
+end = time()
+print(f"took { str(end - start)[:7] } seconds")
+print(model.summary())
+np.exp(model.params)
+predLog = model.predict(exog=XTest)
+
+print(confusion_matrix(YTest,predLog))
+print(accuracy_score(YTest,predLog)*100)
+
+fpr, tpr, thresholds = roc_curve(y_true=list(df_test['label']), y_score=list(pred))
+auc = roc_auc_score(y_true=list(df_test['label']), y_score=list(pred))
+stat.roc(fpr=fpr, tpr=tpr, auc=auc, shade_auc=False, per_class=True, legendpos='upper center', legendanchor=(0.5, 1.08), legendcols=3, show=True)
+
+'Model 2: Decision Tree'
+from sklearn.tree import plot_tree
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.tree import DecisionTreeClassifier
+
+print("training with Decision Tree Classifier...")
+start = time()
+TreeClassifier = DecisionTreeClassifier(criterion="entropy", max_depth=5, random_state=1031)
+clf = TreeClassifier.fit(XTrain,YTrain)
+end = time()
+print(f"took { str(end - start)[:7] } seconds")
+
+predDT = clf.predict(XTest)
+print(confusion_matrix(YTest,predDT))
+print(accuracy_score(YTest,predDT)*100)
+
+plt.figure(figsize=(14,10))
+plot_tree(clf, filled=True, feature_names=column_names, class_names=["0", "1"])
+plt.show()
+
+TreeClassifier = DecisionTreeClassifier(criterion="entropy", max_depth=3, random_state=1031)
+clf = TreeClassifier.fit(XTrain,YTrain)
+predDT = clf.predict(XTest)
+print(confusion_matrix(YTest,predDT))
+print(accuracy_score(YTest,predDT)*100)
+
+TreeClassifier = DecisionTreeClassifier(criterion="entropy", max_depth=10, random_state=1031)
+clf = TreeClassifier.fit(XTrain,YTrain)
+predDT = clf.predict(XTest)
+print(confusion_matrix(YTest,predDT))
+print(accuracy_score(YTest,predDT)*100)
+
+'Model 3: Random Forest'
+from sklearn.ensemble import RandomForestClassifier
+
+ForestClassifier = RandomForestClassifier(
+    n_estimators = 10,
+    n_jobs = -1, #use all CPU cores to fit trees
+    criterion='entropy',
+    random_state=1031)
+
+print("training with Random Forest ...")
+start = time()
+rfc = ForestClassifier.fit(XTrain,YTrain)
+end = time()
+print(f"took { str(end - start)[:7] } seconds")
+
+predRF = rfc.predict(XTest)
+print(confusion_matrix(YTest,predRF))
+print(accuracy_score(YTest,predRF)*100)
+
+trees = rfc.estimators_
+tree1 = trees[0]
+
+plt.figure(figsize=(14,10))
+plot_tree(tree1, filled=True, feature_names=column_names, class_names=["0","1"])
+plt.show()
+
+ForestClassifier = RandomForestClassifier(
+    n_estimators = 8,
+    n_jobs = -1, #use all CPU cores to fit trees
+    criterion='entropy',
+    random_state=1031)
+rfc = ForestClassifier.fit(XTrain,YTrain)
+predRF = rfc.predict(XTest)
+print(confusion_matrix(YTest,predRF))
+print(accuracy_score(YTest,predRF)*100)
+
+ForestClassifier = RandomForestClassifier(
+    n_estimators = 12,
+    n_jobs = -1, #use all CPU cores to fit trees
+    criterion='entropy',
+    random_state=1031)
+rfc = ForestClassifier.fit(XTrain,YTrain)
+predRF = rfc.predict(XTest)
+print(confusion_matrix(YTest,predRF))
+print(accuracy_score(YTest,predRF)*100)
+
+'Model 4: AdaBoost'
+
+from sklearn.ensemble import AdaBoostClassifier
+
+BoostClassifier = AdaBoostClassifier(n_estimators=50, random_state=1031)
+print("training with AdaBoost ...")
+start = time()
+abc = BoostClassifier.fit(XTrain,YTrain)
+end = time()
+print(f"took { str(end - start)[:7] } seconds")
+
+predABC = abc.predict(XTest)
+print(confusion_matrix(YTest,predABC))
+print(accuracy_score(YTest,predABC)*100)
+
+BoostClassifier = AdaBoostClassifier(n_estimators=40, random_state=1031)
+start = time()
+abc = BoostClassifier.fit(XTrain,YTrain)
+predABC = abc.predict(XTest)
+print(confusion_matrix(YTest,predABC))
+print(accuracy_score(YTest,predABC)*100)
+
+BoostClassifier = AdaBoostClassifier(n_estimators=60, random_state=1031)
+start = time()
+abc = BoostClassifier.fit(XTrain,YTrain)
+predABC = abc.predict(XTest)
+print(confusion_matrix(YTest,predABC))
+print(accuracy_score(YTest,predABC)*100)
+
+BoostClassifier = AdaBoostClassifier(n_estimators=70, random_state=1031)
+start = time()
+abc = BoostClassifier.fit(XTrain,YTrain)
+predABC = abc.predict(XTest)
+print(confusion_matrix(YTest,predABC))
+print(accuracy_score(YTest,predABC)*100)
+
+'Model 5: Support Vector Machine (Radial Based Function)'
+from sklearn import svm
+
+print("training with RBF SVM ...")
+start = time()
+rbf_SVM = svm.SVC(kernel='rbf')
+rbf_SVM.fit(XTrain,YTrain)
+end = time()
+print(f"took { str(end - start)[:7] } seconds")
+
+predSVMrbf = rbf_SVM.predict(XTest)
+print(confusion_matrix(YTest,predSVMrbf))
+print(accuracy_score(YTest,predSVMrbf)*100)
+
+#Unfortunately, polynomial and sigmoid caused a processor crash and thus the codes were removed.
